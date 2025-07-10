@@ -1,4 +1,5 @@
 import argparse
+import time
 import cv2
 import numpy as np
 
@@ -47,6 +48,92 @@ def _get_root(keypoints, scores, kpt_thr=0.3):
         return keypoints[valid].mean(axis=0)
 
     return keypoints.mean(axis=0)
+
+
+ANGLES = [
+    (5, 4, 1),   # l face to shoulder
+    (4, 1, 5),   # r face to shoulder
+    (7, 9, 11),  # l elbow
+    (6, 8, 10),  # r elbow
+    (13, 15, 17),  # l leg
+    (12, 14, 16),  # r leg
+    (23, 17, 21),  # l big toe
+    (23, 17, 22),  # l pinky toe
+    (20, 16, 18),  # r big toe
+    (20, 16, 19)   # r pinky toe
+]
+
+
+def _compute_angles(keypoints, scores, kpt_thr=0.3):
+    """Return joint angles in radians for a set of keypoints."""
+    keypoints = np.asarray(keypoints)
+    scores = np.asarray(scores).squeeze()
+    angles = []
+    for a, b, c in ANGLES:
+        if (a >= len(keypoints) or b >= len(keypoints) or c >= len(keypoints)
+                or a >= len(scores) or b >= len(scores) or c >= len(scores)
+                or scores[a] < kpt_thr or scores[b] < kpt_thr
+                or scores[c] < kpt_thr):
+            angles.append(np.nan)
+            continue
+        vec1 = keypoints[a] - keypoints[b]
+        vec2 = keypoints[c] - keypoints[b]
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        if norm1 < 1e-6 or norm2 < 1e-6:
+            angles.append(np.nan)
+            continue
+        cos = np.dot(vec1, vec2) / (norm1 * norm2)
+        cos = float(np.clip(cos, -1.0, 1.0))
+        angles.append(np.arccos(cos))
+    return np.array(angles, dtype=float)
+
+
+def _angle_similarity(user_angles, ref_angles, weights=None):
+    """Compute similarity score between two angle vectors."""
+    user_angles = np.asarray(user_angles, dtype=float)
+    ref_angles = np.asarray(ref_angles, dtype=float)
+    valid = (~np.isnan(user_angles)) & (~np.isnan(ref_angles))
+    if not np.any(valid):
+        return float('nan')
+    if weights is None:
+        weights = np.ones(valid.sum(), dtype=float)
+    else:
+        weights = np.asarray(weights, dtype=float)[valid]
+    weights = weights / weights.sum()
+    diff = np.abs(user_angles[valid] - ref_angles[valid])
+    D = np.sum(weights * diff)
+    return max(0.0, 1.0 - D / np.pi)
+
+
+def _ema_alpha(n=10, retention=0.05):
+    """Compute EMA alpha so old values weigh ``retention`` after ``n`` steps."""
+    return 1.0 - retention ** (1.0 / n)
+
+
+class EMA:
+    """Simple exponential moving average."""
+
+    def __init__(self, alpha):
+        self.alpha = alpha
+        self.value = float('nan')
+
+    def update(self, x):
+        if np.isnan(x):
+            return self.value
+        if np.isnan(self.value):
+            self.value = x
+        else:
+            self.value = self.alpha * x + (1 - self.alpha) * self.value
+        return self.value
+
+
+def _color_from_score(score):
+    """Map a similarity score ``[0,1]`` or ``NaN`` to a BGR color."""
+    if np.isnan(score):
+        return (255, 255, 255)
+    score = float(np.clip(score, 0.0, 1.0))
+    return (0, int(255 * score), int(255 * (1 - score)))
 
 
 def draw_joint_scores(img,
@@ -111,26 +198,33 @@ def draw_joint_scores(img,
     return img
 
 
-def make_error_overlay(kpts_a,
-                       scores_a,
-                       kpts_b,
-                       scores_b,
-                       img_shape,
-                       kpt_thr=0.3,
-                       radius=6,
-                       blur=21):
-    """Return a blurred color overlay representing joint errors.
+def make_error_mask(keypoints,
+                    scores,
+                    img_shape,
+                    kpt_thr=0.3,
+                    radius=6,
+                    blur=21):
+    """Return a blurred mask based on angle centers."""
+    keypoints = np.asarray(keypoints)
+    scores = np.asarray(scores).squeeze()
 
-    The ``radius`` parameter controls how large each keypoint circle is when
-    drawing the error overlay. Using a larger radius increases the chroma of the
-    final silhouette contour.
-    """
-    overlay = np.zeros(img_shape, dtype=np.uint8)
-    overlay = draw_joint_scores(overlay, kpts_a, scores_a, kpts_b, scores_b,
-                                kpt_thr=kpt_thr, radius=radius)
+    if keypoints.ndim == 3:
+        keypoints = keypoints[0]
+        scores = scores[0]
+    if scores.ndim == 0:
+        scores = np.full(len(keypoints), float(scores))
+
+    mask = np.zeros(img_shape[:2], dtype=np.uint8)
+    for _, b, _ in ANGLES:
+        if (b >= len(keypoints) or b >= len(scores) or scores[b] < kpt_thr):
+            continue
+        pt = (int(keypoints[b][0]), int(keypoints[b][1]))
+        cv2.circle(mask, pt, radius, 255, -1)
+
     k = blur if blur % 2 == 1 else blur + 1
-    overlay = cv2.GaussianBlur(overlay, (k, k), 0)
-    return overlay
+    if k >= 3:
+        mask = cv2.GaussianBlur(mask, (k, k), 0)
+    return mask
 
 
 def draw_pose_silhouette(img,
@@ -140,7 +234,8 @@ def draw_pose_silhouette(img,
                          radius=15,
                          fill_color=(64, 64, 64),
                          thickness=2,
-                         error_overlay=None):
+                         error_mask=None,
+                         outline_color=(0, 160, 0)):
     """Draw a convex hull silhouette from pose keypoints.
 
     Args:
@@ -163,7 +258,8 @@ def draw_pose_silhouette(img,
                                       radius=radius,
                                       fill_color=fill_color,
                                       thickness=thickness,
-                                      error_overlay=error_overlay)
+                                      error_mask=error_mask,
+                                      outline_color=outline_color)
         return img
 
     scores = np.squeeze(scores)
@@ -216,14 +312,16 @@ def draw_pose_silhouette(img,
     if np.any(idx):
         img[idx] = (img[idx] * (1 - alpha) + np.array(fill_color) * alpha).astype(np.uint8)
 
-    # overlay the gradient error colors along the silhouette edge. if no
-    # error overlay is supplied, fall back to a solid green outline.
-    if error_overlay is not None:
-        color_mask = cv2.bitwise_and(error_overlay, error_overlay, mask=border_mask)
+    # overlay the outline with the given color using the blurred mask
+    if error_mask is not None:
+        colored = np.zeros((*img.shape[:2], 3), dtype=np.uint8)
+        for c in range(3):
+            colored[..., c] = (error_mask * (outline_color[c] / 255.0)).astype(np.uint8)
+        color_mask = cv2.bitwise_and(colored, colored, mask=border_mask)
         color_mask = np.clip(color_mask * 1.2, 0, 255).astype(np.uint8)
         img = cv2.addWeighted(img, 1.0, color_mask, 1.0, 0)
     else:
-        cv2.drawContours(img, [hull], -1, (0, 160, 0), thickness+6)
+        cv2.drawContours(img, [hull], -1, outline_color, thickness + 6)
 
     # ensure the contour outline sits on top of the fill
 
@@ -273,6 +371,12 @@ def main():
 
     body = Wholebody(mode=args.mode, backend=args.backend, device=args.device)
 
+    alpha = _ema_alpha(10)
+    emas = [EMA(alpha) for _ in ANGLES]
+    last_score = float('nan')
+    last_eval = time.time()
+    eval_interval = 0.5
+
     while cap_video.isOpened() and cap_webcam.isOpened():
         ret_v, frame_v = cap_video.read()
         ret_w, frame_w = cap_webcam.read()
@@ -282,23 +386,37 @@ def main():
         kpts_v, scores_v = body(frame_v)
         kpts_w, scores_w = body(frame_w)
 
-        err_v = make_error_overlay(kpts_v,
-                                   scores_v,
-                                   kpts_w,
-                                   scores_w,
-                                   frame_v.shape,
-                                   kpt_thr=args.kpt_thr,
-                                   radius=max(3, int(args.radius * 1.5)),
-                                   blur=args.radius * 4 + 1)
+        ang_v = _compute_angles(kpts_v, scores_v, args.kpt_thr)
+        ang_w = _compute_angles(kpts_w, scores_w, args.kpt_thr)
+        diff = np.abs(ang_w - ang_v)
+        for i, d in enumerate(diff):
+            emas[i].update(d)
 
-        err_w = make_error_overlay(kpts_w,
-                                   scores_w,
-                                   kpts_v,
-                                   scores_v,
-                                   frame_w.shape,
-                                   kpt_thr=args.kpt_thr,
-                                   radius=max(3, int(args.radius * 1.5)),
-                                   blur=args.radius * 4 + 1)
+        if time.time() - last_eval >= eval_interval:
+            last_eval = time.time()
+            vals = np.array([ema.value for ema in emas], dtype=float)
+            valid = ~np.isnan(vals)
+            if np.any(valid):
+                weights = np.ones(valid.sum()) / valid.sum()
+                D = np.sum(weights * vals[valid])
+                last_score = max(0.0, 1.0 - D / np.pi)
+            else:
+                last_score = float('nan')
+        color = _color_from_score(last_score)
+
+        err_v_mask = make_error_mask(kpts_v,
+                                     scores_v,
+                                     frame_v.shape,
+                                     kpt_thr=args.kpt_thr,
+                                     radius=max(3, args.radius // 2),
+                                     blur=args.radius * 2 + 1)
+
+        err_w_mask = make_error_mask(kpts_w,
+                                     scores_w,
+                                     frame_w.shape,
+                                     kpt_thr=args.kpt_thr,
+                                     radius=max(3, args.radius // 2),
+                                     blur=args.radius * 2 + 1)
 
         disp_v = draw_pose_silhouette(frame_v.copy(),
                                       kpts_v,
@@ -307,7 +425,8 @@ def main():
                                       radius=args.radius,
                                       fill_color=(0, 0, 0),
                                       thickness=4,
-                                      error_overlay=err_v)
+                                      error_mask=err_v_mask,
+                                      outline_color=color)
 
         disp_w = draw_pose_silhouette(frame_w.copy(),
                                       kpts_w,
@@ -316,7 +435,8 @@ def main():
                                       radius=args.radius,
                                       fill_color=(0, 0, 0),
                                       thickness=4,
-                                      error_overlay=err_w)
+                                      error_mask=err_w_mask,
+                                      outline_color=color)
 
         disp_v = draw_joint_scores(disp_v, kpts_v, scores_v, kpts_w, scores_w,
                                    kpt_thr=args.kpt_thr,
