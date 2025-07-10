@@ -198,14 +198,33 @@ def draw_joint_scores(img,
     return img
 
 
-def make_error_overlay(color,
-                       img_shape,
-                       blur=21):
-    """Return a blurred color overlay for the silhouette outline."""
-    overlay = np.full(img_shape, color, dtype=np.uint8)
+def make_error_mask(keypoints,
+                    scores,
+                    img_shape,
+                    kpt_thr=0.3,
+                    radius=6,
+                    blur=21):
+    """Return a blurred mask based on angle centers."""
+    keypoints = np.asarray(keypoints)
+    scores = np.asarray(scores).squeeze()
+
+    if keypoints.ndim == 3:
+        keypoints = keypoints[0]
+        scores = scores[0]
+    if scores.ndim == 0:
+        scores = np.full(len(keypoints), float(scores))
+
+    mask = np.zeros(img_shape[:2], dtype=np.uint8)
+    for _, b, _ in ANGLES:
+        if (b >= len(keypoints) or b >= len(scores) or scores[b] < kpt_thr):
+            continue
+        pt = (int(keypoints[b][0]), int(keypoints[b][1]))
+        cv2.circle(mask, pt, radius, 255, -1)
+
     k = blur if blur % 2 == 1 else blur + 1
-    overlay = cv2.GaussianBlur(overlay, (k, k), 0)
-    return overlay
+    if k >= 3:
+        mask = cv2.GaussianBlur(mask, (k, k), 0)
+    return mask
 
 
 def draw_pose_silhouette(img,
@@ -215,7 +234,8 @@ def draw_pose_silhouette(img,
                          radius=15,
                          fill_color=(64, 64, 64),
                          thickness=2,
-                         error_overlay=None):
+                         error_mask=None,
+                         outline_color=(0, 160, 0)):
     """Draw a convex hull silhouette from pose keypoints.
 
     Args:
@@ -238,7 +258,8 @@ def draw_pose_silhouette(img,
                                       radius=radius,
                                       fill_color=fill_color,
                                       thickness=thickness,
-                                      error_overlay=error_overlay)
+                                      error_mask=error_mask,
+                                      outline_color=outline_color)
         return img
 
     scores = np.squeeze(scores)
@@ -291,14 +312,16 @@ def draw_pose_silhouette(img,
     if np.any(idx):
         img[idx] = (img[idx] * (1 - alpha) + np.array(fill_color) * alpha).astype(np.uint8)
 
-    # overlay the gradient error colors along the silhouette edge. if no
-    # error overlay is supplied, fall back to a solid green outline.
-    if error_overlay is not None:
-        color_mask = cv2.bitwise_and(error_overlay, error_overlay, mask=border_mask)
+    # overlay the outline with the given color using the blurred mask
+    if error_mask is not None:
+        colored = np.zeros((*img.shape[:2], 3), dtype=np.uint8)
+        for c in range(3):
+            colored[..., c] = (error_mask * (outline_color[c] / 255.0)).astype(np.uint8)
+        color_mask = cv2.bitwise_and(colored, colored, mask=border_mask)
         color_mask = np.clip(color_mask * 1.2, 0, 255).astype(np.uint8)
         img = cv2.addWeighted(img, 1.0, color_mask, 1.0, 0)
     else:
-        cv2.drawContours(img, [hull], -1, (0, 160, 0), thickness+6)
+        cv2.drawContours(img, [hull], -1, outline_color, thickness + 6)
 
     # ensure the contour outline sits on top of the fill
 
@@ -381,13 +404,19 @@ def main():
                 last_score = float('nan')
         color = _color_from_score(last_score)
 
-        err_v = make_error_overlay(color,
-                                   frame_v.shape,
-                                   blur=args.radius * 4 + 1)
+        err_v_mask = make_error_mask(kpts_v,
+                                     scores_v,
+                                     frame_v.shape,
+                                     kpt_thr=args.kpt_thr,
+                                     radius=max(3, args.radius // 2),
+                                     blur=args.radius * 2 + 1)
 
-        err_w = make_error_overlay(color,
-                                   frame_w.shape,
-                                   blur=args.radius * 4 + 1)
+        err_w_mask = make_error_mask(kpts_w,
+                                     scores_w,
+                                     frame_w.shape,
+                                     kpt_thr=args.kpt_thr,
+                                     radius=max(3, args.radius // 2),
+                                     blur=args.radius * 2 + 1)
 
         disp_v = draw_pose_silhouette(frame_v.copy(),
                                       kpts_v,
@@ -396,7 +425,8 @@ def main():
                                       radius=args.radius,
                                       fill_color=(0, 0, 0),
                                       thickness=4,
-                                      error_overlay=err_v)
+                                      error_mask=err_v_mask,
+                                      outline_color=color)
 
         disp_w = draw_pose_silhouette(frame_w.copy(),
                                       kpts_w,
@@ -405,7 +435,8 @@ def main():
                                       radius=args.radius,
                                       fill_color=(0, 0, 0),
                                       thickness=4,
-                                      error_overlay=err_w)
+                                      error_mask=err_w_mask,
+                                      outline_color=color)
 
         disp_v = draw_joint_scores(disp_v, kpts_v, scores_v, kpts_w, scores_w,
                                    kpt_thr=args.kpt_thr,
